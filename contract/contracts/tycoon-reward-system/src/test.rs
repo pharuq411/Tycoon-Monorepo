@@ -1,6 +1,8 @@
 extern crate std;
 
-use crate::{DataKey, TycoonRewardSystem, TycoonRewardSystemClient, VOUCHER_ID_START};
+use crate::{
+    DataKey, TycoonRewardSystem, TycoonRewardSystemClient, CONTRACT_VERSION, VOUCHER_ID_START,
+};
 use soroban_sdk::testutils::Address as TestAddress;
 use soroban_sdk::{token, Address, Env};
 
@@ -627,4 +629,188 @@ fn test_is_paused_before_init_returns_false() {
     let contract_id = env.register(TycoonRewardSystem, ());
     let client = TycoonRewardSystemClient::new(&env, &contract_id);
     assert!(!client.is_paused());
+}
+
+// ===========================================================================
+// Contract version
+// ===========================================================================
+
+#[test]
+fn test_get_contract_version_returns_current() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = setup(&env);
+    // Must match the compile-time constant.
+    assert_eq!(client.get_contract_version(), CONTRACT_VERSION);
+    assert_eq!(client.get_contract_version(), 2);
+}
+
+#[test]
+fn test_get_contract_version_before_init() {
+    // Version is a constant — does not require initialization.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(TycoonRewardSystem, ());
+    let client = TycoonRewardSystemClient::new(&env, &contract_id);
+    assert_eq!(client.get_contract_version(), 2);
+}
+
+// ===========================================================================
+// Deprecated entrypoint — redeem_voucher (legacy)
+// ===========================================================================
+
+/// Calling the deprecated `redeem_voucher` must:
+///   1. Emit a `DeprecWarn` event.
+///   2. Increment the deprecated-call counter for index 0.
+///   3. Panic with the migration hint message.
+#[test]
+fn test_deprecated_redeem_voucher_panics_with_migration_message() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = setup(&env);
+
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.redeem_voucher(&1_000_000_000);
+    }));
+    assert!(res.is_err(), "deprecated redeem_voucher must always panic");
+}
+
+#[test]
+fn test_deprecated_redeem_voucher_emits_deprecation_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = setup(&env);
+
+    // Capture event count before the deprecated call.
+    let before = env.events().all().len();
+
+    // The call panics — that is expected; we catch it so the test can proceed.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.redeem_voucher(&1_000_000_000);
+    }));
+
+    // At least one new event should have been published (the DeprecWarn).
+    let after = env.events().all().len();
+    assert!(
+        after > before,
+        "deprecated call must emit at least one DeprecWarn event"
+    );
+}
+
+#[test]
+fn test_deprecated_call_counter_starts_at_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = setup(&env);
+    // Before any deprecated call, counter must be zero.
+    assert_eq!(client.get_deprecated_call_count(&0), 0);
+}
+
+#[test]
+fn test_deprecated_call_counter_increments_on_each_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = setup(&env);
+
+    assert_eq!(client.get_deprecated_call_count(&0), 0);
+
+    // First call.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.redeem_voucher(&1_000_000_000);
+    }));
+    assert_eq!(
+        client.get_deprecated_call_count(&0),
+        1,
+        "counter must be 1 after first deprecated call"
+    );
+
+    // Second call.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.redeem_voucher(&1_000_000_001);
+    }));
+    assert_eq!(
+        client.get_deprecated_call_count(&0),
+        2,
+        "counter must be 2 after second deprecated call"
+    );
+}
+
+#[test]
+fn test_deprecated_call_counter_unknown_index_returns_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, _, _, _) = setup(&env);
+    // Index 99 does not correspond to any entrypoint — must return 0, not panic.
+    assert_eq!(client.get_deprecated_call_count(&99), 0);
+}
+
+#[test]
+fn test_deprecated_redeem_voucher_does_not_redeem_tokens() {
+    // Even though the call panics, it must not have silently moved any tokens.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, tyc_token_id, _) = setup(&env);
+    let user = Address::generate(&env);
+
+    fund_tyc(&env, &tyc_token_id, &contract_id, 10_000);
+    let token_id = client.mint_voucher(&admin, &user, &500);
+
+    // Capture balances before the deprecated call.
+    let tyc_client = token::Client::new(&env, &tyc_token_id);
+    let contract_bal_before = tyc_client.balance(&contract_id);
+    let user_bal_before = tyc_client.balance(&user);
+    let voucher_bal_before = client.get_balance(&user, &token_id);
+
+    // Attempt legacy redemption — must panic without touching balances.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.redeem_voucher(&token_id);
+    }));
+
+    // Balances must be unchanged.
+    assert_eq!(tyc_client.balance(&contract_id), contract_bal_before);
+    assert_eq!(tyc_client.balance(&user), user_bal_before);
+    assert_eq!(client.get_balance(&user, &token_id), voucher_bal_before);
+    // Voucher still exists and is redeemable via the canonical path.
+    assert_eq!(client.get_voucher_value(&token_id), Some(500));
+}
+
+/// After a failed legacy call, the canonical `redeem_voucher_from` must still
+/// work correctly — stale deprecated-call state must not corrupt redemption.
+#[test]
+fn test_canonical_redeem_works_after_deprecated_call() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id, admin, tyc_token_id, _) = setup(&env);
+    let user = Address::generate(&env);
+
+    fund_tyc(&env, &tyc_token_id, &contract_id, 10_000);
+    let token_id = client.mint_voucher(&admin, &user, &500);
+
+    // Invoke the deprecated entrypoint (it will panic / be caught).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.redeem_voucher(&token_id);
+    }));
+
+    // Deprecated counter incremented, but the voucher is untouched.
+    assert_eq!(client.get_deprecated_call_count(&0), 1);
+
+    // The canonical redemption path must succeed without interference.
+    client.redeem_voucher_from(&user, &token_id);
+
+    let tyc_client = token::Client::new(&env, &tyc_token_id);
+    assert_eq!(tyc_client.balance(&user), 500);
+    assert_eq!(client.get_balance(&user, &token_id), 0);
+    assert_eq!(client.get_voucher_value(&token_id), None);
+}
+
+/// Ensure the deprecated call counter is independent of other contract state
+/// (pause, uninitialized contract, etc.).
+#[test]
+fn test_deprecated_call_counter_before_init_returns_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(TycoonRewardSystem, ());
+    let client = TycoonRewardSystemClient::new(&env, &contract_id);
+    // Counter must default to 0 even on an uninitialised contract.
+    assert_eq!(client.get_deprecated_call_count(&0), 0);
 }

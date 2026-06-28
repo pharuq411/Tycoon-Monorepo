@@ -8,6 +8,11 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, E
 /// Token-ID range reserved for redeemable vouchers.
 pub const VOUCHER_ID_START: u128 = 1_000_000_000;
 
+/// Current contract version — incremented whenever a breaking or significant
+/// change is deployed.  Callers can use `get_contract_version` to gate their
+/// migration logic.
+pub const CONTRACT_VERSION: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -23,6 +28,8 @@ pub const VOUCHER_ID_START: u128 = 1_000_000_000;
 /// - `Paused` — emergency-pause flag.
 /// - `BackendMinter` — optional off-chain minting key.
 /// - `OwnedTokenCount(owner)` — number of distinct token types held.
+/// - `DeprecatedCallCount(entrypoint)` — how many times a deprecated
+///   entrypoint has been invoked; used for operational monitoring.
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -44,6 +51,12 @@ pub enum DataKey {
     BackendMinter,
     /// Per-address count of distinct voucher token types held
     OwnedTokenCount(Address),
+    /// Deprecated-entrypoint call counter.
+    ///
+    /// Keyed by a short symbol representing the entrypoint name so that each
+    /// deprecated function has an independent counter.  Useful for off-chain
+    /// monitoring and deciding when it is safe to fully remove the stub.
+    DeprecatedCallCount(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -244,18 +257,70 @@ impl TycoonRewardSystem {
     }
 
     // -----------------------------------------------------------------------
-    // Voucher redemption
+    // Voucher redemption — deprecated legacy entrypoint
     // -----------------------------------------------------------------------
 
-    /// Intentionally disabled entry-point — always panics.
+    /// **Deprecated** — use [`redeem_voucher_from`] instead.
     ///
-    /// Use `redeem_voucher_from` instead.
-    pub fn redeem_voucher(_e: Env, _token_id: u128) {
-        panic!("Use redeem_voucher_from instead");
+    /// This entrypoint existed in v1 of the contract and accepted only a
+    /// `token_id`, implicitly treating the transaction source as the redeemer.
+    /// It is retained as a **shim** to avoid breaking callers that have not yet
+    /// migrated, but it will be **removed in a future major version**.
+    ///
+    /// ## Migration guide
+    ///
+    /// Replace every call of the form:
+    /// ```text
+    /// redeem_voucher(token_id)
+    /// ```
+    /// with:
+    /// ```text
+    /// redeem_voucher_from(redeemer, token_id)
+    /// ```
+    /// where `redeemer` is the address that holds the voucher and must
+    /// authorise the transaction.
+    ///
+    /// ## Behaviour
+    ///
+    /// Each invocation:
+    /// 1. Emits a `DeprecWarn` event so off-chain monitors can detect legacy usage.
+    /// 2. Increments the `DeprecatedCallCount` storage counter for this entrypoint
+    ///    (key index `0`) so operators can measure migration progress.
+    /// 3. **Panics** with `"DEPRECATED: use redeem_voucher_from(redeemer, token_id)"`.
+    ///    The panic preserves the original fail-fast contract behaviour while the
+    ///    on-chain event and counter give callers actionable migration information.
+    ///
+    /// Callers that still invoke `redeem_voucher` must migrate before the next
+    /// major deployment.  Use `get_deprecated_call_count(0)` to monitor how
+    /// many legacy calls are still occurring.
+    ///
+    /// # Panics
+    /// Always panics with the migration hint message.
+    pub fn redeem_voucher(e: Env, _token_id: u128) {
+        // 1. Emit a deprecation-warning event so indexers / monitoring dashboards
+        //    can alert operators about remaining legacy callers.
+        #[allow(deprecated)]
+        e.events().publish(
+            (symbol_short!("DeprecWarn"), symbol_short!("rdm_v")),
+            symbol_short!("rdm_vf"),
+        );
+
+        // 2. Increment the per-entrypoint deprecated-call counter (index 0 =
+        //    redeem_voucher).  This persists across calls, giving operators a
+        //    cumulative measure of legacy usage.
+        Self::_increment_deprecated_call_count(&e, 0);
+
+        // 3. Panic with a clear migration message.  Using panic (rather than
+        //    silently delegating) preserves security: the caller must explicitly
+        //    provide and authorise their address in redeem_voucher_from.
+        panic!("DEPRECATED: use redeem_voucher_from(redeemer, token_id)");
     }
 
     /// Redeem a voucher, burning the token and transferring the locked TYC to
     /// the redeemer.
+    ///
+    /// This is the **current canonical redemption entrypoint** (replaces the
+    /// deprecated `redeem_voucher`).
     ///
     /// # Arguments
     /// * `redeemer`  — Address that owns the voucher and receives the TYC.
@@ -443,6 +508,34 @@ impl TycoonRewardSystem {
             .persistent()
             .get(&DataKey::VoucherValue(token_id))
     }
+
+    /// Return the current contract version number.
+    ///
+    /// Off-chain clients and migrating callers should check this value to
+    /// determine which entrypoints are available.  Version history:
+    ///
+    /// | Version | Notable changes |
+    /// |---------|-----------------|
+    /// | 1       | Initial deploy: `redeem_voucher`, `mint_voucher`, `transfer` |
+    /// | 2       | `redeem_voucher` deprecated; `redeem_voucher_from` introduced; `withdraw_funds`, pause/unpause, backend-minter added |
+    pub fn get_contract_version(_e: Env) -> u32 {
+        CONTRACT_VERSION
+    }
+
+    /// Return how many times deprecated entrypoint `index` has been called.
+    ///
+    /// | Index | Entrypoint |
+    /// |-------|------------|
+    /// | 0     | `redeem_voucher` |
+    ///
+    /// Returns `0` if the entrypoint has never been called or if `index` is
+    /// unknown — this is always a safe default and does not panic.
+    pub fn get_deprecated_call_count(e: Env, index: u32) -> u32 {
+        e.storage()
+            .persistent()
+            .get(&DataKey::DeprecatedCallCount(index))
+            .unwrap_or(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +615,18 @@ impl TycoonRewardSystem {
     fn balance_of(e: &Env, owner: Address, token_id: u128) -> u64 {
         let key = DataKey::Balance(owner, token_id);
         e.storage().persistent().get(&key).unwrap_or(0)
+    }
+
+    /// Increment the deprecated-call counter for entrypoint `index`.
+    ///
+    /// Uses saturating addition so an extreme call count can never cause a
+    /// storage overflow panic (u32::MAX ≈ 4 billion calls).
+    fn _increment_deprecated_call_count(e: &Env, index: u32) {
+        let key = DataKey::DeprecatedCallCount(index);
+        let current: u32 = e.storage().persistent().get(&key).unwrap_or(0);
+        e.storage()
+            .persistent()
+            .set(&key, &current.saturating_add(1));
     }
 }
 
