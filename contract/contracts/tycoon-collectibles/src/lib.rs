@@ -409,10 +409,7 @@ impl TycoonCollectibles {
         token_id: u128,
     ) -> Result<(), CollectibleError> {
         caller.require_auth();
-
-        if is_paused(&env) {
-            return Err(CollectibleError::ContractPaused);
-        }
+        require_not_paused(&env)?;
 
         let balance = get_balance(&env, &caller, token_id);
         if balance < 1 {
