@@ -71,7 +71,7 @@ export class TracingService {
   /**
    * Log an event on a span.
    */
-  addEvent(span: Span | null, name: string, attrs?: Record<string, unknown>): void {
+  addEvent(span: Span | null, name: string, attrs?: Record<string, string | number | boolean>): void {
     if (!span) return;
     span.addEvent(name, attrs);
   }

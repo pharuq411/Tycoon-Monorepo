@@ -150,9 +150,15 @@ describe('Shop purchase — idempotency replay and concurrent-key (SW-BE-033)', 
         },
       ],
     })
-      // Skip JWT so tests can hit the endpoint without a real token
+      // Simulate an authenticated user — real auth tested separately
       .overrideGuard(JwtAuthGuard)
-      .useValue({ canActivate: () => true })
+      .useValue({
+        canActivate: (context: ExecutionContext) => {
+          const req = context.switchToHttp().getRequest();
+          req.user = { id: 42 };
+          return true;
+        },
+      })
       // Skip audit-trail interceptor side-effects
       .overrideInterceptor(AuditTrailInterceptor)
       .useValue({ intercept: (_: unknown, next: { handle: () => unknown }) => next.handle() })

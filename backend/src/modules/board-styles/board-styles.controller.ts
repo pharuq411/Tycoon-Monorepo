@@ -10,11 +10,14 @@ import {
   UseInterceptors,
   HttpCode,
   HttpStatus,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiQuery, ApiHeader } from '@nestjs/swagger';
 import { BoardStylesService } from './board-styles.service';
 import { AdvancedCacheInterceptor } from '../../common/interceptors/advanced-cache.interceptor';
 import { CacheOptions } from '../../common/decorators/cache-options.decorator';
+import { RequireAdmin } from '../../common/decorators/admin.decorator';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { CreateBoardStyleDto } from './dto/create-board-style.dto';
 import { UpdateBoardStyleDto } from './dto/update-board-style.dto';
 import { BoardStylesPaginationDto } from './dto/board-styles-pagination.dto';
@@ -30,7 +33,9 @@ export class BoardStylesController {
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Create a new board style (Admin)' })
+  @RequireAdmin()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Create a new board style (Admin only)' })
   @ApiHeader({
     name: 'X-Idempotency-Key',
     required: false,
@@ -86,7 +91,9 @@ export class BoardStylesController {
   }
 
   @Patch(':id')
-  @ApiOperation({ summary: 'Update a board style (Admin)' })
+  @RequireAdmin()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Update a board style (Admin only)' })
   update(
     @Param('id') id: string,
     @Body() updateBoardStyleDto: UpdateBoardStyleDto,
@@ -95,7 +102,9 @@ export class BoardStylesController {
   }
 
   @Delete(':id')
-  @ApiOperation({ summary: 'Delete a board style (Admin)' })
+  @RequireAdmin()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({ summary: 'Delete a board style (Admin only)' })
   remove(@Param('id') id: string) {
     return this.boardStylesService.remove(+id);
   }

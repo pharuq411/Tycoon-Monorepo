@@ -1,5 +1,3 @@
-// src/chances/chances.controller.ts
-
 import {
   Controller,
   Get,
@@ -34,7 +32,6 @@ export class ChanceController {
     return this.chanceService.findAll(queryDto);
   }
 
-  @Post()
   @Get('draw')
   async draw(): Promise<Chance> {
     return await this.chanceService.drawCard();

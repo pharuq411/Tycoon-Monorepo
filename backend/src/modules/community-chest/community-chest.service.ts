@@ -1,5 +1,8 @@
 import {
   Injectable,
+  ConflictException,
+  InternalServerErrorException,
+  Inject,
   HttpException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -12,6 +15,8 @@ import {
   CommunityChestSortBy,
   COMMUNITY_CHEST_MAX_LIMIT,
 } from './dto/get-community-chest-list.dto';
+import { RANDOM_PROVIDER } from '../../common/random-provider';
+import type { RandomProvider } from '../../common/random-provider';
 import { PaginatedResponse } from '../../common/interfaces/paginated-response.interface';
 import { secureRandomInt } from '../../common/crypto-secure-random';
 import {
@@ -24,6 +29,8 @@ export class CommunityChestService {
   constructor(
     @InjectRepository(CommunityChest)
     private readonly communityChestRepository: Repository<CommunityChest>,
+    @Inject(RANDOM_PROVIDER)
+    private readonly rng: RandomProvider,
     private readonly errorMapper: CommunityChestErrorMapperService,
   ) {}
 
@@ -32,7 +39,7 @@ export class CommunityChestService {
     if (count === 0) {
       return null;
     }
-    const skip = secureRandomInt(count);
+    const skip = this.rng.nextInt(count);
     const rows = await this.communityChestRepository.find({
       order: { id: 'ASC' },
       skip,
